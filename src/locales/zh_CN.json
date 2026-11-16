@@ -452,7 +452,9 @@
       "sortSites": "按站点数",
       "sortTime": "按时间",
       "sortTitle": "按标题",
-      "summary": "共 {0} 组 / {1} 条结果 · 多站 {2} 组"
+      "summary": "共 {0} 组 / {1} 条结果 · 多站 {2} 组",
+      "toggle": "聚合视图",
+      "openSite": "打开该站点的种子详情页"
     },
     "ActionTd": {
       "copyLink": "复制下载链接",

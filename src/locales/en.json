@@ -452,7 +452,9 @@
       "sortSites": "Site count",
       "sortTime": "Time",
       "sortTitle": "Title",
-      "summary": "{0} group(s) / {1} torrent(s) · {2} multi-site"
+      "summary": "{0} group(s) / {1} torrent(s) · {2} multi-site",
+      "toggle": "Aggregate view",
+      "openSite": "Open this site's torrent detail page"
     },
     "ActionTd": {
       "copyLink": "Copy Download Link",
