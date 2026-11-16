@@ -1,33 +1,33 @@
 <script setup lang="ts">
-import { computed, ref, shallowRef, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import { useRoute } from "vue-router";
 import { useI18n } from "vue-i18n";
-import { useDisplay, type DataTableHeader } from "vuetify";
-import {
-  EResultParseStatus,
-  ETorrentStatus,
-  getTorrentVolumeFactors,
-  normalizeTorrentPromotion,
-  promotionToTags,
-} from "@ptd/site";
+import { useDisplay } from "vuetify";
+import { EResultParseStatus, normalizeTorrentPromotion, type ITorrentTag } from "@ptd/site";
 
 import { useMetadataStore } from "@/options/stores/metadata.ts";
 import { useConfigStore } from "@/options/stores/config.ts";
 import { useRuntimeStore } from "@/options/stores/runtime.ts";
-import { useTableColumnFit } from "@/options/directives/useTableColumnFit.ts";
 import { formatDate, formatSize, formatTimeAgo } from "@/options/utils.ts";
 import type { ISearchResultTorrent } from "@/shared/types.ts";
 
 import SiteName from "@/options/components/SiteName.vue";
 import SiteFavicon from "@/options/components/SiteFavicon/Index.vue";
-import TorrentTitleTd from "@/options/components/TorrentTitleTd.vue";
 
 import ActionTd from "./ActionTd.vue";
-import TorrentProcessTd from "./TorrentProcessTd.vue";
 import QuickFilterNotice from "./QuickFilterNotice.vue";
 import SearchStatusDialog from "./SearchStatusDialog.vue";
 import SaveSnapshotDialog from "./SaveSnapshotDialog.vue";
 import AdvanceFilterGenerateDialog from "./AdvanceFilterGenerateDialog.vue";
+
+import {
+  getSiteCountColor,
+  groupSearchResults,
+  sortAggregatedGroups,
+  type IAggregatedGroup,
+  type IAggregatedSiteEntry,
+  type TAggregateSortKey,
+} from "./utils/aggregate";
 
 // 主要助手方法
 import { tableCustomFilter } from "./utils/filter";
@@ -39,6 +39,52 @@ const configStore = useConfigStore();
 const metadataStore = useMetadataStore();
 const runtimeStore = useRuntimeStore();
 const display = useDisplay();
+
+type TAggregateFilter = "all" | "multi2" | "multi3";
+
+const showAdvanceFilterGenerateDialog = ref<boolean>(false);
+const showSearchStatusDialog = ref<boolean>(false);
+const showSaveSnapshotDialog = ref<boolean>(false);
+
+/** 聚合视图的排序方式（站点数优先 = 优先展示「更多站点都有」的种子） */
+const aggregateSort = ref<TAggregateSortKey>("sites");
+/** 聚合视图的站点数筛选 */
+const aggregateFilter = ref<TAggregateFilter>("all");
+/** 当前展开的分组（key 由 归一化标题 + 大小 组成，结果增量更新时保持展开状态） */
+const expandedKeys = ref<Set<string>>(new Set());
+/** 已勾选的种子（用 uniqueId 记录，聚合重排 / 分页时不会错位） */
+const selectedIds = ref<Set<string>>(new Set());
+const aggregatePage = ref(1);
+
+const isSearchingParsed = ref<boolean>(searchQueue.isPaused);
+
+function pauseSearchQueue() {
+  console.log("pauseSearchQueue", searchQueue);
+  searchQueue.pause();
+  isSearchingParsed.value = true;
+}
+
+function startSearchQueue() {
+  console.log("startSearchQueue", searchQueue);
+  searchQueue.start();
+  isSearchingParsed.value = false;
+}
+
+function cancelSearchQueue() {
+  searchQueue.clear(); // 清空搜索队列
+  // 将搜索队列中状态设置为跳过
+  for (const key of Object.keys(runtimeStore.search.searchPlan)) {
+    // @ts-ignore
+    if (runtimeStore.search.searchPlan[key]!.status === EResultParseStatus.waiting) {
+      // @ts-ignore
+      runtimeStore.search.searchPlan[key]!.status = EResultParseStatus.passParse;
+      // @ts-ignore
+      runtimeStore.search.searchPlan[key]!.statusMsg = "i18n.userCancel";
+    }
+  }
+
+  runtimeStore.search.isSearching = false;
+}
 
 /**
  * 只对「搜索快照」在加载时做一次归一（数据是 sendMessage 回来的普通对象，尚未进入 Pinia store）。
@@ -52,99 +98,27 @@ function normalizeSnapshotPromotions(items: ISearchResultTorrent[] = []) {
   items.forEach((item) => normalizeTorrentPromotion(item));
 }
 
-const showAdvanceFilterGenerateDialog = ref<boolean>(false);
-const showSearchStatusDialog = ref<boolean>(false);
-const showSaveSnapshotDialog = ref<boolean>(false);
-
-/** 优惠信息的展示形式：tags（默认，仅标签）/ factor / both / none（不显示），见 SetBase → 搜索 */
-const promotionDisplay = computed<"tags" | "factor" | "both" | "none">(() => {
-  const value = configStore.searchEntifyControl.promotionDisplay;
-  return value === "factor" || value === "both" || value === "none" ? value : "tags";
-});
-const showPromoColumn = computed(() => promotionDisplay.value === "factor" || promotionDisplay.value === "both");
-
-/** 种子标题超长时的显示方式（设置页与搜索页显示偏好共用同一配置） */
-const titleDisplayModeOptions = computed(() => [
-  { title: t("SearchEntity.index.titleDisplayModeOptions.end"), value: "end" },
-  { title: t("SearchEntity.index.titleDisplayModeOptions.middle"), value: "middle" },
-  { title: t("SearchEntity.index.titleDisplayModeOptions.scroll"), value: "scroll" },
+const sortOptions = computed(() => [
+  { title: t("SearchEntity.aggregate.sortSites"), value: "sites" as const },
+  { title: t("SearchEntity.aggregate.sortSeeders"), value: "seeders" as const },
+  { title: t("SearchEntity.aggregate.sortSize"), value: "size" as const },
+  { title: t("SearchEntity.aggregate.sortTime"), value: "time" as const },
+  { title: t("SearchEntity.aggregate.sortTitle"), value: "title" as const },
 ]);
 
-const fullTableHeader = computed(
-  () =>
-    [
-      { title: t("common.site"), key: "site", align: "center", props: { disabled: true } },
-      {
-        title: t("SearchEntity.index.table.title"),
-        key: "title",
-        align: "start",
-        minWidth: "30rem",
-        ...(display.smAndDown.value ? { maxWidth: "32vw" } : {}),
-        props: { disabled: true },
-      },
-      { title: t("SearchEntity.index.table.category"), key: "category", align: "center" },
-      ...(showPromoColumn.value
-        ? [
-            {
-              title: t("SearchEntity.index.table.downloadVolumeFactor"),
-              key: "downloadVolumeFactor",
-              align: "center",
-              sortRaw: promoSortRaw,
-            },
-          ]
-        : []),
-      { title: t("SearchEntity.index.table.size"), key: "size", align: "end" },
-      { title: t("SearchEntity.index.table.seeders"), key: "seeders", align: "end" },
-      { title: t("SearchEntity.index.table.leechers"), key: "leechers", align: "end" },
-      { title: t("SearchEntity.index.table.completed"), key: "completed", align: "end" },
-      { title: t("SearchEntity.index.table.comments"), key: "comments", align: "end" },
-      { title: t("SearchEntity.index.table.time"), key: "time", align: "center" },
-      {
-        title: t("common.action"),
-        key: "action",
-        align: "center",
-        sortable: false,
-        props: { disabled: true },
-      },
-    ] as (DataTableHeader & { props?: any })[],
-);
-
-const tableHeader = computed(() => {
-  return fullTableHeader.value.filter(
-    (item) => item?.props?.disabled || configStore.tableBehavior.SearchEntity.columns!.includes(item.key!),
-  ) as DataTableHeader[];
-});
-
-/**
- * 优惠信息展示形式与列配置同步：切到 factor / both 时自动勾选「优惠」列，
- * 切回 tags 时取消（顺带清理旧版本残留在列配置里的 key）。
- * 只监听模式变化，这样用户在 factor 模式下仍可在列选择器里手动取消该列。
- */
-watch(
-  showPromoColumn,
-  (enabled, oldEnabled) => {
-    if (enabled === oldEnabled) return;
-
-    const columns = configStore.tableBehavior.SearchEntity.columns ?? [];
-    const hasPromoColumn = columns.includes("downloadVolumeFactor");
-    if (enabled && !hasPromoColumn) {
-      configStore.updateTableBehavior("SearchEntity", "columns", [...columns, "downloadVolumeFactor"]);
-    } else if (!enabled && hasPromoColumn) {
-      configStore.updateTableBehavior(
-        "SearchEntity",
-        "columns",
-        columns.filter((key) => key !== "downloadVolumeFactor"),
-      );
-    }
-  },
-  { immediate: true },
-);
-
+/** 表格筛选（站点、标签、发布状态、时间/大小/做种等范围）同样作用到聚合前的原始结果 */
 const { tableFilterRef, tableWaitFilterRef, tableFilterFn, buildAdvanceItemPropsFn, buildFilterDictFn } =
   tableCustomFilter;
 
-// 使用 shallowRef 优化：种子对象数组不需要深度响应式，提升性能
-const tableSelectedRaw = shallowRef<ISearchResultTorrent[]>([]);
+const hiddenTagNamesText = computed({
+  get: () => configStore.searchEntifyControl.hiddenTagNames.join("\n"),
+  set: (val: string) => {
+    configStore.searchEntifyControl.hiddenTagNames = val
+      .split("\n")
+      .map((item) => item.trim())
+      .filter(Boolean);
+  },
+});
 
 watch(
   () => route.query,
@@ -168,7 +142,7 @@ watch(
         (newParams.plan && newParams.plan != oldParams?.plan)
       ) {
         // 清理已选择项 （ #622 ）
-        tableSelectedRaw.value = [];
+        selectedIds.value = new Set();
         // doSearch 会自动处理过滤器重置
         doSearch((newParams.search as string) ?? "", (newParams.plan as string) ?? "default", true);
       }
@@ -177,148 +151,131 @@ watch(
   { immediate: true, deep: true },
 );
 
-const isSearchingParsed = ref<boolean>(searchQueue.isPaused);
+const filteredItems = computed(() =>
+  runtimeStore.search.searchResult.filter((item) => tableFilterFn(item.uniqueId, tableFilterRef.value, { raw: item })),
+);
 
-function pauseSearchQueue() {
-  console.log("pauseSearchQueue", searchQueue);
-  searchQueue.pause();
-  isSearchingParsed.value = true;
+const allGroups = computed(() => groupSearchResults(filteredItems.value));
+
+const multiSiteGroupCount = computed(() => allGroups.value.filter((group) => group.siteCount >= 2).length);
+
+const visibleGroups = computed(() => {
+  let groups = allGroups.value;
+  if (aggregateFilter.value === "multi2") groups = groups.filter((group) => group.siteCount >= 2);
+  else if (aggregateFilter.value === "multi3") groups = groups.filter((group) => group.siteCount >= 3);
+  return sortAggregatedGroups(groups, aggregateSort.value);
+});
+
+const itemsPerPage = computed(() => configStore.tableBehavior.SearchEntity.itemsPerPage || 50);
+
+const pageCount = computed(() => Math.max(1, Math.ceil(visibleGroups.value.length / itemsPerPage.value)));
+
+const pagedGroups = computed(() => {
+  const start = (aggregatePage.value - 1) * itemsPerPage.value;
+  return visibleGroups.value.slice(start, start + itemsPerPage.value);
+});
+
+const selectedTorrents = computed<ISearchResultTorrent[]>(() =>
+  runtimeStore.search.searchResult.filter((item) => selectedIds.value.has(item.uniqueId)),
+);
+
+watch([aggregateFilter, aggregateSort, tableFilterRef, itemsPerPage], () => {
+  aggregatePage.value = 1;
+});
+
+watch(pageCount, (count) => {
+  if (aggregatePage.value > count) aggregatePage.value = count;
+});
+
+// ---------------------------------------------------------------------------
+// 选择 / 展开
+// ---------------------------------------------------------------------------
+
+function isItemSelected(item: ISearchResultTorrent): boolean {
+  return selectedIds.value.has(item.uniqueId);
 }
 
-function startSearchQueue() {
-  console.log("startSearchQueue", searchQueue);
-  searchQueue.start();
-  isSearchingParsed.value = false;
-}
-
-function cancelSearchQueue() {
-  console.log("cancelSearchQueue", searchQueue);
-  searchQueue.clear(); // 清空搜索队列
-  // 将搜索队列中状态设置为跳过
-  for (const key of Object.keys(runtimeStore.search.searchPlan)) {
-    // @ts-ignore
-    if (runtimeStore.search.searchPlan[key]!.status === EResultParseStatus.waiting) {
-      // @ts-ignore
-      runtimeStore.search.searchPlan[key]!.status = EResultParseStatus.passParse;
-      // @ts-ignore
-      runtimeStore.search.searchPlan[key]!.statusMsg = "i18n.userCancel";
+function getGroupSelectedCount(group: IAggregatedGroup): { selected: number; total: number } {
+  let selected = 0;
+  let total = 0;
+  for (const entry of group.sites) {
+    for (const item of entry.items) {
+      total += 1;
+      if (selectedIds.value.has(item.uniqueId)) selected += 1;
     }
   }
-
-  runtimeStore.search.isSearching = false;
+  return { selected, total };
 }
 
-const tableNonBooleanControlKey = ["maxTagCountBeforeGroup", "hiddenTagNames", "promotionDisplay", "titleDisplayMode"];
+function isGroupSelected(group: IAggregatedGroup): boolean {
+  const { selected, total } = getGroupSelectedCount(group);
+  return total > 0 && selected === total;
+}
 
-// 过滤出表格控制中非布尔类型的键
-const filteredTableBooleanControlKeys = computed(() => {
-  return Object.keys(configStore.searchEntifyControl).filter(
-    (key) => tableNonBooleanControlKey.indexOf(key) === -1,
-  ) as (keyof typeof configStore.searchEntifyControl)[];
-});
+function isGroupIndeterminate(group: IAggregatedGroup): boolean {
+  const { selected, total } = getGroupSelectedCount(group);
+  return selected > 0 && selected < total;
+}
 
-const hiddenTagNamesText = computed({
-  get: () => configStore.searchEntifyControl.hiddenTagNames.join("\n"),
-  set: (val: string) => {
-    configStore.searchEntifyControl.hiddenTagNames = val
-      .split("\n")
-      .map((s) => s.trim())
-      .filter(Boolean);
-  },
-});
-
-// 相同大小种子分组色条（ #1411 ），len 为 8，按 size 升序循环，保证相邻分组不同色
-const sizeGroupPalette = ["#F44336", "#2196F3", "#4CAF50", "#FF9800", "#9C27B0", "#00BCD4", "#8BC34A", "#795548"];
-
-// sizeKey 以表格中实际展示的大小文本为准：web 解析出的 1.02 GiB 与 API 给出的 bytes 只要展示一致就会同组
-const getSizeKey = (size?: number) => (size ? String(formatSize(size)) : "");
-
-const sizeGroupColors = computed(() => {
-  const colors = new Map<string, string>();
-  const sortBy = configStore.tableBehavior.SearchEntity.sortBy;
-
-  // 仅在开启开关且当前按大小排序时生效
-  if (!configStore.searchEntifyControl.highlightSameSizeTorrent || !sortBy?.some((item) => item.key === "size")) {
-    return colors;
-  }
-
-  const groups = new Map<string, { size: number; count: number }>();
-  for (const item of runtimeStore.search.searchResult) {
-    if (!item.size) continue;
-    const key = getSizeKey(item.size);
-    const group = groups.get(key);
-    if (group) {
-      group.count++;
-    } else {
-      groups.set(key, { size: item.size, count: 1 });
+function toggleGroupSelection(group: IAggregatedGroup) {
+  const next = new Set(selectedIds.value);
+  const selectAll = !isGroupSelected(group);
+  for (const entry of group.sites) {
+    for (const item of entry.items) {
+      if (selectAll) next.add(item.uniqueId);
+      else next.delete(item.uniqueId);
     }
   }
-
-  // 按 size 升序编号（仅在 count > 1 时才画出色条）
-  [...groups.entries()]
-    .sort(([, a], [, b]) => a.size - b.size)
-    .forEach(([key, { count }], index) => {
-      if (count > 1) colors.set(key, sizeGroupPalette[index % sizeGroupPalette.length]!);
-    });
-
-  return colors;
-});
-
-function sizeGroupRowProps({ item }: { item: ISearchResultTorrent }) {
-  const color = sizeGroupColors.value.get(getSizeKey(item.size));
-  return color ? { style: { "--ptd-size-group-color": color } } : {};
+  selectedIds.value = next;
 }
 
-/**
- * 缓存每个种子的量系数：promoSortRaw 在排序时会被调用 O(n log n) 次，
- * 若每次都从 tags 反推（每条标签要跑一遍预定义正则），上万条结果时会直接把界面卡死。
- */
-const volumeFactorCache = new WeakMap<ISearchResultTorrent, ReturnType<typeof getTorrentVolumeFactors>>();
-
-function getCachedVolumeFactors(item: ISearchResultTorrent) {
-  let factors = volumeFactorCache.get(item);
-  if (!factors) {
-    factors = getTorrentVolumeFactors(item);
-    volumeFactorCache.set(item, factors);
-  }
-  return factors;
+function toggleItemSelection(item: ISearchResultTorrent) {
+  const next = new Set(selectedIds.value);
+  if (next.has(item.uniqueId)) next.delete(item.uniqueId);
+  else next.add(item.uniqueId);
+  selectedIds.value = next;
 }
 
-/**
- * 优惠列的排序：下载系数升序（免费在前），同系数时上传倍数高的在前。
- * 只有上传倍率、没有下载折扣的种子按「正常下载」参与排序（不能当成未知排到最后）。
- */
-function promoSortRaw(a: ISearchResultTorrent, b: ISearchResultTorrent): number {
-  const factorsA = getCachedVolumeFactors(a);
-  const factorsB = getCachedVolumeFactors(b);
-
-  const downloadA =
-    factorsA.downloadVolumeFactor ??
-    (factorsA.uploadVolumeFactor !== undefined && factorsA.uploadVolumeFactor !== 1 ? 1 : Number.POSITIVE_INFINITY);
-  const downloadB =
-    factorsB.downloadVolumeFactor ??
-    (factorsB.uploadVolumeFactor !== undefined && factorsB.uploadVolumeFactor !== 1 ? 1 : Number.POSITIVE_INFINITY);
-
-  if (downloadA !== downloadB) return downloadA - downloadB;
-
-  return (factorsB.uploadVolumeFactor ?? 1) - (factorsA.uploadVolumeFactor ?? 1);
+function toggleExpanded(key: string) {
+  const next = new Set(expandedKeys.value);
+  if (next.has(key)) next.delete(key);
+  else next.add(key);
+  expandedKeys.value = next;
 }
 
-/**
- * 优惠列展示：与标签使用同一套「因子 → 标签」规则（promotionToTags）。
- * 这样只有上传倍率的种子（如 2xUp）也会显示出来，而不是被当成「无优惠」显示 -。
- */
-function promoCellText(item: ISearchResultTorrent): string {
-  const { downloadVolumeFactor, uploadVolumeFactor } = getCachedVolumeFactors(item);
-  if (downloadVolumeFactor === undefined && uploadVolumeFactor === undefined) return "-";
-
-  const text = promotionToTags(downloadVolumeFactor, uploadVolumeFactor)
-    .map((tag) => tag.name)
-    .join(" · ");
-  return text || "-";
+function expandAllVisible() {
+  expandedKeys.value = new Set(pagedGroups.value.map((group) => group.key));
 }
 
-const { tableRef: fitTableRef, fittedHeaders, tableClass: fitTableClass } = useTableColumnFit(tableHeader);
+function collapseAll() {
+  expandedKeys.value = new Set();
+}
+
+// ---------------------------------------------------------------------------
+// 展示辅助
+// ---------------------------------------------------------------------------
+
+/** 组内展示的标签：尊重「显示标签」开关、隐藏标签名单与最大数量设置 */
+function visibleTags(tags: ITorrentTag[] = [], maxCount = 3): ITorrentTag[] {
+  if (!configStore.searchEntifyControl.showTorrentTag) return [];
+  const hidden = configStore.searchEntifyControl.hiddenTagNames ?? [];
+  const limit = maxCount > 0 ? maxCount : 3;
+  return tags.filter((tag) => tag?.name && !hidden.includes(tag.name)).slice(0, limit);
+}
+
+function formatTorrentTime(time?: number): string {
+  if (!time) return "-";
+  return configStore.searchEntifyControl.uploadAtFormatAsAlive ? formatTimeAgo(time) : formatDate(time, "yyyy-MM-dd");
+}
+
+function getFirstSiteLink(group: IAggregatedGroup): string {
+  return group.sites[0]?.best.url ?? "";
+}
+
+function onDownloadButtonClick(event: MouseEvent) {
+  // 站内链接都在新标签打开，避免把聚合页面顶掉
+  event.stopPropagation();
+}
 </script>
 
 <template>
@@ -382,9 +339,10 @@ const { tableRef: fitTableRef, fittedHeaders, tableClass: fitTableClass } = useT
       </template>
     </v-alert-title>
   </v-alert>
+
   <v-card>
     <v-card-title>
-      <v-row gap="0" class="ma-0">
+      <v-row gap="0" class="ma-0 align-center">
         <!-- 不指定 size：Vuetify 4 下图标按钮为 (--v-btn-height + 12px) 的正方形（48 × 48），与 ActionTd 保持一致 -->
         <v-btn-group variant="text">
           <!-- 启动/暂停 搜索队列 -->
@@ -443,10 +401,12 @@ const { tableRef: fitTableRef, fittedHeaders, tableClass: fitTableClass } = useT
 
         <v-divider vertical class="mx-2" />
 
-        <ActionTd :torrent-items="tableSelectedRaw" />
+        <!-- 批量操作（下载 / 辅种 / 收藏）作用于勾选的种子 -->
+        <ActionTd :torrent-items="selectedTorrents" />
 
         <v-divider vertical class="mx-2" />
 
+        <!-- 显示偏好：聚合视图下只有「标签」与「时间格式」还起作用 -->
         <v-menu :close-on-content-click="false">
           <template v-slot:activator="{ props }">
             <v-btn-group variant="text">
@@ -459,23 +419,27 @@ const { tableRef: fitTableRef, fittedHeaders, tableClass: fitTableClass } = useT
             </v-btn-group>
           </template>
           <v-list>
-            <v-list-item class="mb-1">
-              <v-select
-                v-model="configStore.searchEntifyControl.titleDisplayMode"
-                :items="titleDisplayModeOptions"
-                :label="t('SearchEntity.index.titleDisplayMode')"
-                color="success"
-                density="compact"
-                hide-details
-                @update:model-value="() => configStore.$save()"
-              />
-            </v-list-item>
-            <v-list-item v-for="item in filteredTableBooleanControlKeys" :key="item" :value="item">
+            <v-list-item>
               <template v-slot:prepend>
                 <v-list-item-action start class="ml-2">
                   <v-switch
-                    v-model="configStore.searchEntifyControl[item]"
-                    :label="`&nbsp;${t('SearchEntity.index.' + item)}`"
+                    v-model="configStore.searchEntifyControl.showTorrentTag"
+                    :label="`&nbsp;${t('SearchEntity.index.showTorrentTag')}`"
+                    color="success"
+                    density="compact"
+                    hide-details
+                    @click.stop
+                    @update:model-value="() => configStore.$save()"
+                  />
+                </v-list-item-action>
+              </template>
+            </v-list-item>
+            <v-list-item>
+              <template v-slot:prepend>
+                <v-list-item-action start class="ml-2">
+                  <v-switch
+                    v-model="configStore.searchEntifyControl.uploadAtFormatAsAlive"
+                    :label="`&nbsp;${t('SearchEntity.index.uploadAtFormatAsAlive')}`"
                     color="success"
                     density="compact"
                     hide-details
@@ -497,29 +461,47 @@ const { tableRef: fitTableRef, fittedHeaders, tableClass: fitTableClass } = useT
           </v-list>
         </v-menu>
 
-        <v-combobox
-          v-model="configStore.tableBehavior.SearchEntity.columns"
-          :items="fullTableHeader"
-          :return-object="false"
-          chips
-          class="table-header-filter-clear ml-1"
+        <v-divider vertical class="mx-2" />
+
+        <!-- 聚合排序 / 站点数筛选 / 展开收起 -->
+        <v-select
+          v-model="aggregateSort"
+          :items="sortOptions"
           density="compact"
           hide-details
-          item-value="key"
-          max-width="180"
-          multiple
-          prepend-inner-icon="mdi-filter-cog"
-          @update:model-value="(v) => configStore.updateTableBehavior('SearchEntity', 'columns', v)"
+          max-width="150"
+          prepend-inner-icon="mdi-sort"
+          :title="t('SearchEntity.aggregate.sort')"
+        />
+
+        <v-btn-toggle
+          :model-value="aggregateFilter"
+          class="ml-2"
+          density="compact"
+          divided
+          mandatory
+          variant="outlined"
+          @update:model-value="(value) => (aggregateFilter = (value ?? 'all') as TAggregateFilter)"
         >
-          <template #chip="{ item, index }">
-            <v-chip v-if="index === 0">
-              <span>{{ item.title }}</span>
-            </v-chip>
-            <span v-if="index === 1" class="text-grey text-body-small">
-              (+{{ configStore.tableBehavior.SearchEntity.columns!.length - 1 }})
-            </span>
-          </template>
-        </v-combobox>
+          <v-btn size="small" value="all">{{ t("SearchEntity.aggregate.filterAll") }}</v-btn>
+          <v-btn size="small" value="multi2">{{ t("SearchEntity.aggregate.filterMulti") }}</v-btn>
+          <v-btn size="small" value="multi3">{{ t("SearchEntity.aggregate.filterMulti3") }}</v-btn>
+        </v-btn-toggle>
+
+        <v-btn-group variant="text">
+          <v-btn
+            :title="t('SearchEntity.aggregate.expandAll')"
+            icon="mdi-arrow-expand-vertical"
+            size="small"
+            @click="expandAllVisible"
+          />
+          <v-btn
+            :title="t('SearchEntity.aggregate.collapseAll')"
+            icon="mdi-arrow-collapse-vertical"
+            size="small"
+            @click="collapseAll"
+          />
+        </v-btn-group>
 
         <v-spacer />
         <v-text-field
@@ -540,105 +522,128 @@ const { tableRef: fitTableRef, fittedHeaders, tableClass: fitTableClass } = useT
 
     <v-card-text class="pt-2 pb-0">
       <!-- 站点筛选器、已选种子等提示信息 -->
-      <QuickFilterNotice :selected-torrents="tableSelectedRaw" />
+      <QuickFilterNotice :selected-torrents="selectedTorrents" />
 
-      <v-data-table
-        ref="fitTableRef"
-        :class="fitTableClass"
-        id="ptd-search-entity-table"
-        v-model="tableSelectedRaw"
-        :custom-filter="tableFilterFn"
-        :filter-keys="['uniqueId'] /* 对每个item值只检索一次 */"
-        :headers="fittedHeaders"
-        :items="runtimeStore.search.searchResult"
-        :items-per-page="configStore.tableBehavior.SearchEntity.itemsPerPage"
-        :search="tableFilterRef"
-        :sort-by="configStore.tableBehavior.SearchEntity.sortBy"
-        class="search-entity-table table-stripe table-header-no-wrap"
-        hover
-        item-value="uniqueId"
-        :multi-sort="configStore.enableTableMultiSort"
-        :row-props="sizeGroupRowProps"
-        show-select
-        return-object
-        @update:itemsPerPage="(v) => configStore.updateTableBehavior('SearchEntity', 'itemsPerPage', v)"
-        @update:sortBy="(v) => configStore.updateTableBehavior('SearchEntity', 'sortBy', v)"
-      >
-        <!-- 站点图标 -->
-        <template #item.site="{ item }">
-          <div class="d-flex flex-column align-center">
-            <SiteFavicon :site-id="item.site" :size="configStore.searchEntifyControl.showSiteName ? 18 : 24" />
-            <SiteName v-if="configStore.searchEntifyControl.showSiteName" :site-id="item.site" />
+      <div class="agg-summary d-flex align-center ga-4 px-1 py-2 text-body-small text-medium-emphasis">
+        <span>
+          {{ t("SearchEntity.aggregate.summary", [visibleGroups.length, filteredItems.length, multiSiteGroupCount]) }}
+        </span>
+        <v-spacer />
+        <span v-if="pageCount > 1">{{ t("SearchEntity.aggregate.page", [aggregatePage, pageCount]) }}</span>
+      </div>
+
+      <div class="agg-list">
+        <div
+          v-for="group in pagedGroups"
+          :key="group.key"
+          class="agg-group"
+          :class="{ 'agg-group--multi': group.siteCount >= 2 }"
+        >
+          <div class="agg-head" @click="toggleExpanded(group.key)">
+            <v-checkbox-btn
+              :indeterminate="isGroupIndeterminate(group)"
+              :model-value="isGroupSelected(group)"
+              class="flex-0-0"
+              density="compact"
+              hide-details
+              :title="t('SearchEntity.aggregate.selectGroup')"
+              @click.stop
+              @update:model-value="() => toggleGroupSelection(group)"
+            />
+
+            <v-chip :color="getSiteCountColor(group.siteCount)" class="agg-badge" label size="small">
+              {{ t("SearchEntity.aggregate.siteCount", [group.siteCount]) }}
+            </v-chip>
+
+            <a
+              :href="getFirstSiteLink(group)"
+              :title="group.title"
+              class="agg-title text-body-large text-high-emphasis text-decoration-none text-truncate"
+              rel="noopener noreferrer nofollow"
+              target="_blank"
+              @click.stop
+            >
+              {{ group.title }}
+            </a>
+
+            <div class="agg-tags">
+              <v-chip v-for="tag in visibleTags(group.tags)" :key="tag.name" :color="tag.color" label size="x-small">
+                {{ tag.name }}
+              </v-chip>
+            </div>
+
+            <v-spacer />
+            <span class="agg-size">{{ formatSize(group.size) }}</span>
+            <span class="agg-seeders text-success" :title="t('SearchEntity.index.table.seeders')">
+              ↑{{ group.totalSeeders }}
+            </span>
+            <v-icon :icon="expandedKeys.has(group.key) ? 'mdi-chevron-up' : 'mdi-chevron-down'" size="small" />
           </div>
-        </template>
 
-        <!-- 主标题，副标题，优惠及标签 -->
-        <template #item.title="{ item }">
-          <TorrentTitleTd :item="item" />
-        </template>
+          <div v-if="expandedKeys.has(group.key)" class="agg-sites">
+            <div
+              v-for="entry in group.sites"
+              :key="entry.site"
+              class="agg-site"
+              :class="{ 'agg-site--compact': display.smAndDown.value }"
+            >
+              <!-- 包一层容器：Vuetify 的 .v-selection-control 带有 grid 命名区，直接作为 grid 子项会被摆到行尾 -->
+              <div class="agg-check" @click.stop>
+                <v-checkbox-btn
+                  :model-value="isItemSelected(entry.best)"
+                  density="compact"
+                  hide-details
+                  :title="t('SearchEntity.aggregate.selectSite')"
+                  @update:model-value="() => toggleItemSelection(entry.best)"
+                />
+              </div>
 
-        <!-- 优惠（下载量系数），默认隐藏，勾选后可按优惠排序 -->
-        <template #item.downloadVolumeFactor="{ item }">
-          <span class="text-no-wrap" :class="promoCellText(item) === '-' ? 'text-grey' : ''">
-            {{ promoCellText(item) }}
-          </span>
-        </template>
+              <div class="agg-site-name">
+                <SiteFavicon :site-id="entry.site" :size="16" />
+                <SiteName :site-id="entry.site" class="text-body-medium" tag="span" />
+                <v-chip v-if="entry.count > 1" size="x-small" variant="text">×{{ entry.count }}</v-chip>
+              </div>
 
-        <!-- 种子大小，下载情况 -->
-        <template #item.size="{ item }">
-          <!-- Vuetify 4 的 v-container 已无 no-gutters 属性，v-row 间距也改用 flex gap，故用 pa-0 + gap="0" 还原紧凑布局 -->
-          <v-container class="pa-0">
-            <v-row gap="0">
-              <v-col class="pa-0">
-                <span class="t_size text-no-wrap">{{ formatSize(item.size ?? 0) }}</span>
-              </v-col>
-            </v-row>
-            <v-row v-if="item.status && (item.status as ETorrentStatus) !== ETorrentStatus.unknown" gap="0">
-              <v-col class="pa-0">
-                <TorrentProcessTd :torrent="item"></TorrentProcessTd>
-              </v-col>
-            </v-row>
-          </v-container>
-        </template>
+              <span class="agg-num text-success" :title="t('SearchEntity.index.table.seeders')">
+                ↑{{ entry.best.seeders }}
+              </span>
+              <span class="agg-num text-error" :title="t('SearchEntity.index.table.leechers')">
+                ↓{{ entry.best.leechers }}
+              </span>
+              <span v-if="!display.smAndDown.value" class="agg-num" :title="t('SearchEntity.index.table.completed')">
+                {{ entry.best.completed }}
+              </span>
+              <span v-if="!display.smAndDown.value" class="agg-time">
+                {{ formatTorrentTime(entry.best.time) }}
+              </span>
 
-        <!-- 上传人数 -->
-        <template #item.seeders="{ item }">
-          <span class="t_seeders text-no-wrap">{{ item.seeders }}</span>
-        </template>
+              <div class="agg-tags">
+                <v-chip
+                  v-for="tag in visibleTags(entry.best.tags ?? [], 3)"
+                  :key="tag.name"
+                  :color="tag.color"
+                  label
+                  size="x-small"
+                >
+                  {{ tag.name }}
+                </v-chip>
+              </div>
 
-        <!-- 下载人数 -->
-        <template #item.leechers="{ item }">
-          <span class="t_leechers text-no-wrap">{{ item.leechers }}</span>
-        </template>
+              <div class="agg-site-actions" @click.stop="onDownloadButtonClick">
+                <ActionTd :torrent-items="[entry.best]" density="compact" :show-keep-upload-btn="false" />
+              </div>
+            </div>
+          </div>
+        </div>
 
-        <!-- 完成人数 -->
-        <template #item.completed="{ item }">
-          <span class="t_completed text-no-wrap">{{ item.completed }}</span>
-        </template>
+        <v-alert v-if="!pagedGroups.length" class="ma-1" type="info" variant="tonal">
+          {{ t("SearchEntity.aggregate.empty") }}
+        </v-alert>
+      </div>
 
-        <!-- 评论人数 -->
-        <template #item.comments="{ item }">
-          <span class="t_comments text-no-wrap">{{ item.comments }}</span>
-        </template>
-
-        <!-- 发布日期 -->
-        <template #item.time="{ item }">
-          <span class="t_time text-no-wrap" :title="item.time ? (formatDate(item.time) as string) : '-'">
-            {{
-              item.time
-                ? configStore.searchEntifyControl.uploadAtFormatAsAlive
-                  ? formatTimeAgo(item.time)
-                  : formatDate(item.time)
-                : "-"
-            }}
-          </span>
-        </template>
-
-        <!-- 其他操作 -->
-        <template #item.action="{ item }">
-          <ActionTd :torrent-items="[item]" density="compact" :show-keep-upload-btn="false" />
-        </template>
-      </v-data-table>
+      <div v-if="pageCount > 1" class="d-flex justify-center py-3">
+        <v-pagination v-model="aggregatePage" :length="pageCount" :total-visible="7" density="comfortable" />
+      </div>
     </v-card-text>
   </v-card>
 
@@ -648,25 +653,116 @@ const { tableRef: fitTableRef, fittedHeaders, tableClass: fitTableClass } = useT
 </template>
 
 <style scoped lang="scss">
-#ptd-search-entity-table {
-  :deep(td.v-data-table__td) {
-    padding: 0 8px;
+.agg-list {
+  padding-bottom: 8px;
+}
+
+.agg-group {
+  border: 1px solid rgba(var(--v-theme-on-surface), 0.12);
+  border-radius: 8px;
+  margin-bottom: 6px;
+  overflow: hidden;
+
+  &--multi {
+    border-left: 3px solid rgb(var(--v-theme-success));
+  }
+}
+
+.agg-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 8px;
+  cursor: pointer;
+
+  &:hover {
+    background: rgba(var(--v-theme-on-surface), 0.04);
+  }
+}
+
+.agg-badge {
+  flex: 0 0 auto;
+  min-width: 52px;
+  justify-content: center;
+}
+
+.agg-title {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.agg-tags {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 4px;
+  max-width: 35%;
+  overflow: hidden;
+}
+
+.agg-size {
+  flex: 0 0 auto;
+  color: rgba(var(--v-theme-on-surface), 0.6);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.agg-seeders {
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.agg-sites {
+  border-top: 1px dashed rgba(var(--v-theme-on-surface), 0.12);
+}
+
+.agg-check {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.agg-site {
+  display: grid;
+  grid-template-columns: 32px minmax(120px, 170px) 52px 52px 52px 86px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px 0 2px;
+
+  &:hover {
+    background: rgba(var(--v-theme-on-surface), 0.03);
   }
 
-  /* 相同大小种子的分组色条（ #1411 ），颜色由 row-props 写入的 --ptd-size-group-color 提供 */
-  :deep(td.v-data-table__td--select-row) {
-    position: relative;
-
-    &::before {
-      content: "";
-      position: absolute;
-      top: 4px;
-      bottom: 4px;
-      left: 1px;
-      width: 3px;
-      border-radius: 2px;
-      background-color: var(--ptd-size-group-color, transparent);
-    }
+  &--compact {
+    grid-template-columns: 32px minmax(100px, 150px) 48px 48px minmax(0, 1fr) auto;
   }
+}
+
+.agg-site-name {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.agg-num {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.agg-time {
+  color: rgba(var(--v-theme-on-surface), 0.6);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.agg-site-actions {
+  display: flex;
+  justify-content: flex-end;
 }
 </style>

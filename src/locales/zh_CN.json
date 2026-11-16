@@ -435,6 +435,25 @@
     }
   },
   "SearchEntity": {
+    "aggregate": {
+      "collapseAll": "全部收起",
+      "empty": "当前筛选条件下没有种子，试试切到「全部」或清空筛选词。",
+      "expandAll": "展开当前页全部",
+      "filterAll": "全部",
+      "filterMulti": "≥2 站",
+      "filterMulti3": "≥3 站",
+      "page": "第 {0} / {1} 页",
+      "selectGroup": "选中本组全部站点",
+      "selectSite": "选中该站点",
+      "siteCount": "{0} 站",
+      "sort": "排序方式",
+      "sortSeeders": "按做种数",
+      "sortSize": "按大小",
+      "sortSites": "按站点数",
+      "sortTime": "按时间",
+      "sortTitle": "按标题",
+      "summary": "共 {0} 组 / {1} 条结果 · 多站 {2} 组"
+    },
     "ActionTd": {
       "copyLink": "复制下载链接",
       "copyLinkFailed": "复制下载链接失败",

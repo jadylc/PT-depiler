@@ -435,6 +435,25 @@
     }
   },
   "SearchEntity": {
+    "aggregate": {
+      "collapseAll": "Collapse all",
+      "empty": "No torrents match the current filter. Try switching to \"All\" or clearing the filter.",
+      "expandAll": "Expand current page",
+      "filterAll": "All",
+      "filterMulti": "≥2 sites",
+      "filterMulti3": "≥3 sites",
+      "page": "Page {0} / {1}",
+      "selectGroup": "Select every site in this group",
+      "selectSite": "Select this site",
+      "siteCount": "{0} sites",
+      "sort": "Sort by",
+      "sortSeeders": "Seeders",
+      "sortSize": "Size",
+      "sortSites": "Site count",
+      "sortTime": "Time",
+      "sortTitle": "Title",
+      "summary": "{0} group(s) / {1} torrent(s) · {2} multi-site"
+    },
     "ActionTd": {
       "copyLink": "Copy Download Link",
       "copyLinkFailed": "Failed to copy download link",

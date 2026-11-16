@@ -9,6 +9,11 @@ on:
     outputs:
       version:
         value: ${{ jobs.build.outputs.version }}
+  workflow_dispatch:
+
+# 供 fork 的自动发布步骤使用：创建/更新 Release 需要写权限
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -101,3 +106,45 @@ jobs:
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
         run: pnpm action:upload_telegram
         continue-on-error: true
+
+      # ---------------------------------------------------------------------
+      # fork 专用：把每次 master 推送的 Chrome 构建发布到固定 tag 的 Release，
+      # 这样直接下载 extension-chrome.zip 解压后「加载已解压的扩展程序」即可。
+      # ---------------------------------------------------------------------
+      - name: Write install note into build
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && github.repository == 'jadylc/PT-depiler' }}
+        run: |
+          cat > build/安装说明.txt <<'EOF'
+          PT-depiler 自动构建（含搜索结果跨站聚合）
+
+          安装：
+            1. 解压 extension-chrome.zip 到任意固定目录（例如 D:\PT-depiler-build）
+            2. 打开 chrome://extensions/ 或 edge://extensions/
+            3. 打开右上角「开发者模式」
+            4. 点「加载已解压的扩展程序」，选择解压出来的目录（包含 manifest.json 的那一层）
+
+          注意：
+            - 已安装商店版的话，建议先在扩展页停用商店版，避免两个版本同时工作。
+            - 本构建每次 master 推送都会覆盖同名 Release 资产，重新下载解压覆盖目录后，
+              在扩展页点一次「重新加载」即可升级。
+          EOF
+          ls -l build/
+
+      - name: Publish build to Release
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && github.repository == 'jadylc/PT-depiler' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-latest
+          name: Latest auto build
+          body: |
+            自动构建（推送 ${{ github.sha }}）
+
+            下载 `extension-chrome.zip` 后解压，在 `chrome://extensions`（或 `edge://extensions`）打开开发者模式，
+            选择「加载已解压的扩展程序」并指向解压目录即可。
+
+            本次构建包含「搜索结果跨站聚合」视图：同一部影片/同一条种子会按站点数量排序，展开即可挑选站点下载。
+          files: |
+            build/extension-chrome.zip
+            build/安装说明.txt
+          overwrite_files: true
+          make_latest: false
