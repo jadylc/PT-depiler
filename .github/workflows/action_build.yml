@@ -112,7 +112,7 @@ jobs:
       # 这样直接下载 extension-chrome.zip 解压后「加载已解压的扩展程序」即可。
       # ---------------------------------------------------------------------
       - name: Write install note into build
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && github.repository == 'jadylc/PT-depiler' }}
+        if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/master' && github.repository == 'jadylc/PT-depiler' }}
         run: |
           cat > build/安装说明.txt <<'EOF'
           PT-depiler 自动构建（含搜索结果跨站聚合）
@@ -131,7 +131,7 @@ jobs:
           ls -l build/
 
       - name: Publish build to Release
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && github.repository == 'jadylc/PT-depiler' }}
+        if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/master' && github.repository == 'jadylc/PT-depiler' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-latest
