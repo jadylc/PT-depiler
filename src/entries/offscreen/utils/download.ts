@@ -343,6 +343,19 @@ async function downloadTorrent(downloadOption: IDownloadTorrentOption) {
     // 生成站点，并检查站点下载间隔，如果触及到站点下载间隔，则将下载任务放入到 alarms 中等待
     siteInstance = await getSiteInstance<"public">(torrent.site);
 
+    // 少数站点解析出的 link 是 `javascript:...` 伪链接（下载按钮实际由页面 JS 触发）。
+    // 这种地址在 offscreen 里 window.open 会被扩展页 CSP 拦截，控制台报
+    // "Executing inline event handler violates ... script-src 'self'"。
+    // 发起下载前先让站点实例重新解析一次真实下载地址。
+    if (typeof torrent.link === "string" && /^\s*javascript:/i.test(torrent.link)) {
+      const resolvedLink = await siteInstance.getTorrentDownloadLink(torrent as ITorrent).catch(() => "");
+      if (resolvedLink) {
+        logger({ msg: `Torrent link is a javascript: pseudo-link, resolved to ${resolvedLink}` });
+        torrent.link = resolvedLink;
+        downloadRequestConfig.url = resolvedLink;
+      }
+    }
+
     if (
       siteInstance.downloadInterval > 0 &&
       // 允许本地下载时忽略站点设置中的下载间隔
@@ -426,6 +439,13 @@ async function downloadTorrentToLocalFile(
   let errorMessage: string | undefined;
 
   const downloadUri = axios.getUri(downloadRequestConfig); // 组装 baseURL, url, params
+
+  // 防御：非 HTTP(S) 地址（javascript: / data: 等）不能交给 window.open / chrome.downloads，
+  // 否则只会在扩展错误页留下 CSP 拦截记录，下载本身静默失败。
+  if (!/^https?:\/\//i.test(downloadUri)) {
+    throw new Error(`无法下载：站点返回的下载地址不是 HTTP(S) URL（${downloadUri}）`);
+  }
+
   const {
     method: downloadMethod = "GET",
     data: downloadData = {},
