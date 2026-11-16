@@ -1,0 +1,127 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # 每 6 小时检查一次上游
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream master
+        id: merge
+        run: |
+          set -uo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/pt-plugins/PT-depiler.git 2>/dev/null || true
+          git fetch --no-tags upstream master
+
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "status=up-to-date" >> "$GITHUB_OUTPUT"
+            echo "上游没有新提交"
+            exit 0
+          fi
+
+          # 记录本次要合并的上游提交，冲突时写进 issue 方便排查
+          {
+            echo "commits<<EOF"
+            git log --oneline HEAD..upstream/master | head -30
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if git merge --no-edit upstream/master; then
+            echo "status=merged" >> "$GITHUB_OUTPUT"
+            echo "合并成功：$(git log --oneline -1)"
+          else
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+            git diff --name-only --diff-filter=U > "${RUNNER_TEMP}/conflict-files.txt" || true
+            echo "冲突文件："
+            cat "${RUNNER_TEMP}/conflict-files.txt" || true
+            git merge --abort || true
+          fi
+
+      - name: Push merged master
+        if: steps.merge.outputs.status == 'merged'
+        run: git push origin HEAD:master
+
+      # 用 GITHUB_TOKEN 产生的 push 不会触发其它 workflow，所以显式派发一次构建
+      - name: Trigger build and release
+        if: steps.merge.outputs.status == 'merged'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run action_build.yml --ref master
+
+      - name: Open issue when merge conflicts
+        if: steps.merge.outputs.status == 'conflict'
+        uses: actions/github-script@v7
+        env:
+          CONFLICT_FILES: ${{ runner.temp }}/conflict-files.txt
+          COMMITS: ${{ steps.merge.outputs.commits }}
+        with:
+          script: |
+            const fs = require("fs");
+            const path = process.env.CONFLICT_FILES;
+            const files = fs.existsSync(path) ? fs.readFileSync(path, "utf8").trim() : "";
+            const commits = (process.env.COMMITS || "").trim();
+            const prefix = "上游同步冲突";
+
+            const { data: openIssues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              per_page: 100,
+            });
+
+            if (openIssues.some((issue) => issue.title.startsWith(prefix))) {
+              core.info("已有未处理的同步冲突 issue，跳过创建");
+              return;
+            }
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `${prefix}（${new Date().toISOString().slice(0, 10)}）`,
+              body: [
+                "自动合并 `pt-plugins/PT-depiler:master` 时发生冲突，已中止合并，仓库保持原样。",
+                "",
+                "**上游待合并提交**",
+                "```",
+                commits || "(未知)",
+                "```",
+                "",
+                "**冲突文件**",
+                "```",
+                files || "(未知)",
+                "```",
+                "",
+                "**本地解决**",
+                "```bash",
+                "cd D:/projects/PT-depiler",
+                "git remote add upstream https://github.com/pt-plugins/PT-depiler.git  # 只需要一次",
+                "git fetch upstream",
+                "git merge upstream/master",
+                "# 手动解决冲突后：",
+                "git add -A && git commit --no-verify",
+                "git push origin master",
+                "```",
+                "",
+                "解决并 push 后 CI 会重新构建、更新 `build-latest` Release，这个 issue 即可关闭。",
+              ].join("\n"),
+            });

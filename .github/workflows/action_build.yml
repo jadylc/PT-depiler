@@ -41,7 +41,8 @@ jobs:
 
       - name: vue-tsc check
         run: pnpm check
-        continue-on-error: ${{ github.event_name == 'push' }}
+        # PR 上严格检查；push / 手动派发（自动同步后触发）只做构建，避免类型检查波动挡住发版
+        continue-on-error: ${{ github.event_name != 'pull_request' }}
 
       - name: Build Output
         run: |
