@@ -3,14 +3,38 @@
  * @JackettDefinitions https://github.com/Jackett/Jackett/blob/master/src/Jackett.Common/Definitions/concertos.yml
  * @Issue https://github.com/pt-plugins/PT-depiler/issues/143
  *
- * 站点为 UNIT3D 9.1.7，Jackett 侧已由 HTML 抓取改用 API（api/torrents/filter）。
- * 与 huno 一类走 JSON API 的 UNIT3D 站点同样处理：保留 Unit3D 引擎（用户信息、详情页、
- * 标签等逻辑仍然适用），只覆写与 JSON 响应相关的搜索配置。
- * 另写首页列表选择器；搜索接口使用 API Token。
+ * 站点为 UNIT3D 9.1.7：配置了 API Token 时搜索走 /api/torrents/filter，未配置时解析页面 HTML 搜索结果。
+ * 首页列表与用户信息选择器按站点改版覆写。
  */
 import type { AxiosRequestConfig, AxiosResponse } from "axios";
-import { NoUserInputError, type ISiteMetadata } from "../types";
+import {
+  NoUserInputError,
+  type ISearchConfig,
+  type ISearchEntryRequestConfig,
+  type ISearchResult,
+  type ISiteMetadata,
+} from "../types";
 import Unit3D, { SchemaMetadata } from "../schemas/Unit3D.ts";
+
+// 未配置 API Token 时使用的 HTML 搜索结果解析
+const htmlSearch: ISearchConfig = {
+  ...SchemaMetadata.search,
+  selectors: {
+    ...SchemaMetadata.search.selectors,
+    rows: { selector: "tr.c-torrent-row[data-torrent-id]" },
+    id: { selector: ":self", attr: "data-torrent-id" },
+    title: { selector: "a.c-torrent-row__name" },
+    url: { selector: "a.c-torrent-row__name", attr: "href" },
+    link: { selector: "a.c-torrent-row__action--download[href]", attr: "href" },
+    category: { selector: ".c-format-cell__category" },
+    size: { selector: "td.c-torrent-row__size" },
+    author: { selector: "a.user-tag__link" },
+    seeders: { selector: ".c-stat-triple__item--seeders .c-stat-triple__value" },
+    leechers: { selector: ".c-stat-triple__item--leechers .c-stat-triple__value" },
+    completed: { selector: ".c-stat-triple__item--completed .c-stat-triple__value" },
+    comments: { text: 0 },
+  },
+};
 
 export const siteMetadata: ISiteMetadata = {
   ...SchemaMetadata,
@@ -29,9 +53,9 @@ export const siteMetadata: ISiteMetadata = {
   userInputSettingMeta: [
     {
       name: "apikey",
-      label: "API Token",
-      hint: "在 Concertos 的 My Settings → API Key 页面获取 API Token；搜索时以 Authorization: Bearer 发送",
-      required: true,
+      label: "API Token（不设置将使用网页搜索）",
+      hint: "在 Concertos 的 My Settings → API Key 页面获取；填写后搜索以 Authorization: Bearer 调用 /api/torrents/filter",
+      required: false,
     },
   ],
 
@@ -99,13 +123,121 @@ export const siteMetadata: ISiteMetadata = {
     ...SchemaMetadata.list,
   ],
 
+  userInfo: {
+    ...SchemaMetadata.userInfo,
+    selectors: {
+      ...SchemaMetadata.userInfo.selectors,
+      uploaded: {
+        ...SchemaMetadata.userInfo.selectors!.uploaded,
+        selector: "dl.c-kv dt:contains('Account upload (total)') + dd",
+      },
+      downloaded: {
+        ...SchemaMetadata.userInfo.selectors!.downloaded,
+        selector: "dl.c-kv dt:contains('Account download (total)') + dd",
+      },
+      trueUploaded: {
+        selector: "dl.c-kv dt:contains('Torrent upload'):not(:contains('credited')) + dd",
+        filters: [{ name: "parseSize" }],
+      },
+      trueDownloaded: {
+        selector: "dl.c-kv dt:contains('Torrent download'):not(:contains('credited')):not(:contains('refunded')) + dd",
+        filters: [{ name: "parseSize" }],
+      },
+      trueRatio: {
+        ...SchemaMetadata.userInfo.selectors!.trueRatio,
+        selector: "dl.c-kv dt:contains('Real ratio') + dd",
+      },
+      seeding: {
+        ...SchemaMetadata.userInfo.selectors!.seeding,
+        selector: "dl.c-profile__strip dt:contains('Seeding') + dd",
+      },
+      bonus: {
+        ...SchemaMetadata.userInfo.selectors!.bonus,
+        selector: "dl.c-profile__strip dt:contains('Bonus points') + dd",
+      },
+      uploads: {
+        ...SchemaMetadata.userInfo.selectors!.uploads,
+        selector: "dl.c-kv:has(a[href*='/uploads'])",
+      },
+      levelName: {
+        ...SchemaMetadata.userInfo.selectors!.levelName,
+        selector: "p.c-profile__eyebrow a[href*='/stats/groups/requirements']",
+      },
+      joinTime: {
+        ...SchemaMetadata.userInfo.selectors!.joinTime,
+        selector: "p.c-profile__eyebrow span:contains('Registered')",
+        filters: [(query: string) => query.replace(/^Registered\s*/i, ""), { name: "parseTime", args: ["yyyy-MM-dd"] }],
+      },
+    },
+  },
+
+  // 来源：https://concertos.live/stats/groups/requirements（页面「By upload」分级，2026-11 实测）
   levelRequirements: [
-    { id: 1, name: "User" },
-    { id: 2, name: "PowerUser" },
+    {
+      id: 0,
+      name: "Leech",
+      privilege: "无法下载新种子",
+    },
+    {
+      id: 1,
+      name: "User",
+      ratio: 0.6,
+    },
+    {
+      id: 2,
+      name: "PowerUser",
+      uploaded: "1TiB",
+      ratio: 0.4,
+      interval: "P30D",
+    },
+    {
+      id: 3,
+      name: "SuperUser",
+      uploaded: "5TiB",
+      ratio: 0.4,
+      interval: "P60D",
+      privilege: "每月 1 个免费令牌（需 31 天内访问过站点，最多累积 10 个）",
+    },
+    {
+      id: 4,
+      name: "ExtremeUser",
+      uploaded: "20TiB",
+      ratio: 0.4,
+      interval: "P90D",
+      privilege: "发布免审核；每月 2 个免费令牌（需 31 天内访问过站点，最多累积 10 个）",
+    },
+    {
+      id: 5,
+      name: "InsaneUser",
+      uploaded: "50TiB",
+      ratio: 0.4,
+      interval: "P180D",
+      privilege: "发布免审核；每月 3 个免费令牌（需 31 天内访问过站点，最多累积 10 个）",
+    },
+    {
+      id: 6,
+      name: "Veteran",
+      uploaded: "100TiB",
+      ratio: 0.4,
+      interval: "P365D",
+      privilege: "发布免审核；全站免费下载",
+    },
   ],
 };
 
 export default class Concertos extends Unit3D {
+  public override async getSearchResult(
+    keywords?: string,
+    searchEntry: ISearchEntryRequestConfig = {},
+  ): Promise<ISearchResult> {
+    // 未填写 API Token 时使用 HTML 搜索结果解析
+    if (!this.userConfig.inputSetting?.apikey?.trim()) {
+      searchEntry = { ...htmlSearch, ...searchEntry, merge: false };
+    }
+
+    return super.getSearchResult(keywords, searchEntry);
+  }
+
   public override async request<T>(
     axiosConfig: AxiosRequestConfig,
     checkLogin: boolean = true,
