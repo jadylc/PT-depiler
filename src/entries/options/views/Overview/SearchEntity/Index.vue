@@ -205,7 +205,7 @@ watch(
       }
     }
   },
-  { immediate: true, deep: true },
+  { immediate: true },
 );
 
 const isSearchingParsed = ref<boolean>(searchQueue.isPaused);
